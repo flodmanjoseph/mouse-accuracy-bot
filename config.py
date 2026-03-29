@@ -28,7 +28,7 @@ HSV_RED_UPPER_2 = np.array([180, 255, 255])
 MIN_CONTOUR_AREA = 50
 
 # Minimum circularity ratio (area / enclosing_circle_area) to filter non-circles
-MIN_CIRCULARITY = 0.55
+MIN_CIRCULARITY = 0.40
 
 # --- Heatmap Generation ---
 GAUSSIAN_SIGMA = 3.0  # Sigma for Gaussian blobs in heatmap

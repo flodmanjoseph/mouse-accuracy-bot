@@ -56,8 +56,26 @@ def find_targets(frame_bgr, exclude_hud=True):
         (cx, cy), radius = cv2.minEnclosingCircle(contour)
         circle_area = np.pi * radius * radius
 
-        # Check circularity
-        if circle_area > 0 and (area / circle_area) >= MIN_CIRCULARITY:
+        # Check circularity — use a lower threshold for bigger contours
+        # because large circles (especially rings/outlines) have lower fill ratios
+        fill_ratio = area / circle_area if circle_area > 0 else 0
+
+        # For large contours (radius > 30px), accept lower fill ratios
+        # This handles hollow/ring-style targets in the game
+        if radius > 30:
+            min_circ = 0.20  # Rings have low fill but are still valid
+        else:
+            min_circ = MIN_CIRCULARITY
+
+        # Also check perimeter-based circularity (works better for rings)
+        perimeter = cv2.arcLength(contour, True)
+        if perimeter > 0:
+            perimeter_circularity = 4 * np.pi * area / (perimeter * perimeter)
+        else:
+            perimeter_circularity = 0
+
+        # Accept if EITHER fill ratio OR perimeter circularity passes
+        if fill_ratio >= min_circ or perimeter_circularity >= 0.4:
             targets.append({
                 "x": int(cx),
                 "y": int(cy),
