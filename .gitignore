@@ -19,5 +19,12 @@ checkpoints/*.pth
 .vscode/
 .idea/
 
+# Debug/temporary images
+*.png
+verify_output/
+
+# Self-play results (generated)
+self_play_results.json
+
 # Environment
 .env
