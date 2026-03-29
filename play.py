@@ -1,5 +1,12 @@
-"""Inference loop: capture screen -> model prediction -> PyAutoGUI click."""
+"""Inference loop: capture screen -> model prediction -> PyAutoGUI click.
+
+KILL SWITCH: Press ESC at any time to stop.
+FAILSAFE:    Move mouse to any screen corner to abort instantly.
+BACKUP:      Ctrl+C in terminal also works.
+"""
+import sys
 import time
+import signal
 import argparse
 import threading
 import numpy as np
@@ -17,53 +24,86 @@ from config import (
 
 # PyAutoGUI settings
 pyautogui.FAILSAFE = True   # Move mouse to corner to abort
-pyautogui.PAUSE = 0.01      # Minimal pause between actions
+pyautogui.PAUSE = 0.005
 
-# Global kill switch
+# ─── Kill Switch (multi-layered) ─────────────────────────────────
 _kill = False
+_kill_lock = threading.Lock()
 
 
-def _listen_for_esc():
-    """Background thread: listen for ESC key to kill the bot."""
+def trigger_kill(source="unknown"):
+    """Set the kill flag from any thread. Thread-safe."""
+    global _kill
+    with _kill_lock:
+        if not _kill:
+            _kill = True
+            print(f"\n{'!'*50}")
+            print(f"  KILL SWITCH ACTIVATED ({source})")
+            print(f"{'!'*50}")
+
+
+def _listen_esc_quartz():
+    """Poll for ESC using macOS Quartz (no special permissions needed)."""
+    global _kill
+    try:
+        import Quartz
+        ESC_KEYCODE = 53
+        while not _kill:
+            pressed = Quartz.CGEventSourceKeyState(
+                Quartz.kCGEventSourceStateHIDSystemState, ESC_KEYCODE
+            )
+            if pressed:
+                trigger_kill("ESC key - Quartz")
+                return
+            time.sleep(0.05)
+    except ImportError:
+        pass
+
+
+def _listen_esc_pynput():
+    """Listen for ESC using pynput (needs Input Monitoring permission)."""
     global _kill
     try:
         from pynput import keyboard
-
         def on_press(key):
-            global _kill
             if key == keyboard.Key.esc:
-                _kill = True
-                print("\n*** ESC pressed — stopping bot ***")
-                return False  # Stop listener
-
+                trigger_kill("ESC key - pynput")
+                return False
         with keyboard.Listener(on_press=on_press) as listener:
             listener.join()
-    except ImportError:
-        # Fallback if pynput not installed — use Quartz events
-        try:
-            import Quartz
-
-            while not _kill:
-                event = Quartz.CGEventCreate(None)
-                flags = Quartz.CGEventGetFlags(event)
-                # Check for ESC via keyboard state polling
-                keys = Quartz.CGEventSourceKeyState(Quartz.kCGEventSourceStateHIDSystemState, 53)  # 53 = ESC
-                if keys:
-                    _kill = True
-                    print("\n*** ESC pressed — stopping bot ***")
-                    break
-                time.sleep(0.05)
-        except ImportError:
-            print("WARNING: Install 'pynput' for ESC kill switch: pip install pynput")
-            print("         Using Ctrl+C or mouse-to-corner as fallback.")
+    except Exception:
+        pass
 
 
 def start_kill_listener():
-    """Start the ESC key listener in a background thread."""
+    """Start ALL kill switch listeners."""
     global _kill
     _kill = False
-    t = threading.Thread(target=_listen_for_esc, daemon=True)
-    t.start()
+
+    # Layer 1: Quartz ESC polling (most reliable on macOS)
+    t1 = threading.Thread(target=_listen_esc_quartz, daemon=True)
+    t1.start()
+
+    # Layer 2: pynput ESC listener (backup)
+    t2 = threading.Thread(target=_listen_esc_pynput, daemon=True)
+    t2.start()
+
+    # Layer 3: Ctrl+C signal handler
+    def signal_handler(sig, frame):
+        trigger_kill("Ctrl+C")
+        sys.exit(0)
+    signal.signal(signal.SIGINT, signal_handler)
+    signal.signal(signal.SIGTERM, signal_handler)
+
+    print("  Kill switches: ESC (Quartz + pynput), Ctrl+C, mouse-to-corner")
+
+
+def is_in_game_region(x, y):
+    """Check if screen coordinates are inside the game region."""
+    left, top, gw, gh = GAME_REGION
+    margin = 10
+    return (left + margin <= x <= left + gw - margin and
+            top + margin <= y <= top + gh - margin)
 
 
 def focus_chrome():
@@ -230,8 +270,10 @@ def play_with_model(model, region=None, delay=None, conf_threshold=None):
                 # Click the highest confidence target
                 best_y, best_x, conf = peaks[0]
                 screen_x, screen_y = heatmap_to_screen(best_y, best_x, region)
-                pyautogui.click(screen_x, screen_y)
-                clicks += 1
+                # SAFETY: Only click inside the game region
+                if is_in_game_region(screen_x, screen_y) and not _kill:
+                    pyautogui.click(screen_x, screen_y)
+                    clicks += 1
             else:
                 no_target_streak += 1
                 if game_started and no_target_streak >= max_no_target:
@@ -274,23 +316,26 @@ def play_with_cv(region=None, delay=None):
 
     print("=== CV MODE (no model, color thresholding) ===")
     print(f"Region: {region}")
-    print("Move mouse to screen corner to abort")
     print("\nSwitching to Chrome...")
     focus_chrome()
+    start_kill_listener()
+    print("Press ESC at any time to stop the bot.")
 
     clicks = 0
     frames = 0
     no_target_streak = 0
-    max_no_target = 15
+    max_no_target = 50
+    game_started = False
     start_time = time.time()
 
     try:
-        while True:
+        while not _kill:
             frame = grab_screen(region)
             targets = find_targets(frame)
 
             if targets:
                 no_target_streak = 0
+                game_started = True
                 # Click the largest target
                 best = max(targets, key=lambda t: t["radius"])
 
@@ -299,13 +344,16 @@ def play_with_cv(region=None, delay=None):
                 phys_w = frame.shape[1]
                 phys_h = frame.shape[0]
 
-                screen_x = left + (best["x"] / phys_w) * width
-                screen_y = top + (best["y"] / phys_h) * height
-                pyautogui.click(int(screen_x), int(screen_y))
-                clicks += 1
+                screen_x = int(left + (best["x"] / phys_w) * width)
+                screen_y = int(top + (best["y"] / phys_h) * height)
+
+                # SAFETY: Only click inside game region
+                if is_in_game_region(screen_x, screen_y) and not _kill:
+                    pyautogui.click(screen_x, screen_y)
+                    clicks += 1
             else:
                 no_target_streak += 1
-                if no_target_streak >= max_no_target:
+                if game_started and no_target_streak >= max_no_target:
                     print(f"\nNo targets for {max_no_target} frames — game over detected.")
                     break
 
@@ -318,9 +366,9 @@ def play_with_cv(region=None, delay=None):
             time.sleep(delay)
 
     except KeyboardInterrupt:
-        pass
+        trigger_kill("Ctrl+C")
     except pyautogui.FailSafeException:
-        print("\nFailsafe triggered")
+        trigger_kill("mouse to corner")
 
     elapsed = time.time() - start_time
     print("\n=== Session Complete ===")

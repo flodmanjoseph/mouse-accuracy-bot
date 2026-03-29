@@ -1,15 +1,21 @@
 """Self-playing RL loop: play games, read results, adjust parameters, improve.
 
-Press ESC at any time to stop.
+KILL SWITCH: Press ESC at any time to stop.
+FAILSAFE:    Move mouse to any screen corner to abort instantly.
+BACKUP:      Ctrl+C in terminal also works.
+HARD LIMIT:  Auto-stops after --timeout minutes (default: 30).
 
 Usage:
     python self_play.py                  # Run continuous self-play
     python self_play.py --rounds 5       # Run 5 games
+    python self_play.py --timeout 10     # Auto-stop after 10 minutes
     python self_play.py --results        # Show history
 """
 import os
+import sys
 import json
 import time
+import signal
 import random
 import argparse
 import threading
@@ -22,28 +28,101 @@ from capture import grab_screen
 from labeler import find_targets
 from config import GAME_REGION, HEATMAP_SIZE, INPUT_SIZE, DEVICE
 
-pyautogui.FAILSAFE = True
-pyautogui.PAUSE = 0.01
+pyautogui.FAILSAFE = True   # Move mouse to corner = instant abort
+pyautogui.PAUSE = 0.005
 
-# Kill switch
+# ─── Kill Switch (multi-layered) ─────────────────────────────────
 _kill = False
+_kill_lock = threading.Lock()
 RESULTS_FILE = os.path.join(os.path.dirname(__file__), "self_play_results.json")
 
 
-def _listen_for_esc():
+def trigger_kill(source="unknown"):
+    """Set the kill flag from any thread. Thread-safe."""
+    global _kill
+    with _kill_lock:
+        if not _kill:
+            _kill = True
+            print(f"\n{'!'*50}")
+            print(f"  KILL SWITCH ACTIVATED ({source})")
+            print(f"{'!'*50}")
+
+
+def _listen_esc_quartz():
+    """Poll for ESC using macOS Quartz (no permissions needed)."""
+    global _kill
+    try:
+        import Quartz
+        ESC_KEYCODE = 53
+        while not _kill:
+            pressed = Quartz.CGEventSourceKeyState(
+                Quartz.kCGEventSourceStateHIDSystemState, ESC_KEYCODE
+            )
+            if pressed:
+                trigger_kill("ESC key - Quartz")
+                return
+            time.sleep(0.05)  # Poll 20x/sec
+    except ImportError:
+        pass  # Quartz not available
+
+
+def _listen_esc_pynput():
+    """Listen for ESC using pynput (needs Input Monitoring permission)."""
     global _kill
     try:
         from pynput import keyboard
         def on_press(key):
-            global _kill
             if key == keyboard.Key.esc:
-                _kill = True
-                print("\n*** ESC pressed — stopping ***")
+                trigger_kill("ESC key - pynput")
                 return False
         with keyboard.Listener(on_press=on_press) as listener:
             listener.join()
     except ImportError:
-        print("Install pynput for ESC support: pip install pynput")
+        pass
+    except Exception:
+        pass  # pynput can fail silently on macOS without permissions
+
+
+def _hard_timeout(minutes):
+    """Auto-kill after N minutes as safety net."""
+    global _kill
+    deadline = time.time() + minutes * 60
+    while not _kill and time.time() < deadline:
+        time.sleep(1)
+    if not _kill:
+        trigger_kill(f"hard timeout ({minutes}min)")
+
+
+def start_kill_listeners(timeout_minutes=30):
+    """Start ALL kill switch listeners. Belt, suspenders, and a parachute."""
+    global _kill
+    _kill = False
+
+    # Layer 1: Quartz ESC polling (most reliable on macOS)
+    t1 = threading.Thread(target=_listen_esc_quartz, daemon=True)
+    t1.start()
+
+    # Layer 2: pynput ESC listener (backup, may need permissions)
+    t2 = threading.Thread(target=_listen_esc_pynput, daemon=True)
+    t2.start()
+
+    # Layer 3: Hard timeout
+    t3 = threading.Thread(target=_hard_timeout, args=(timeout_minutes,), daemon=True)
+    t3.start()
+
+    # Layer 4: Ctrl+C signal handler
+    def signal_handler(sig, frame):
+        trigger_kill("Ctrl+C")
+        sys.exit(0)
+    signal.signal(signal.SIGINT, signal_handler)
+    signal.signal(signal.SIGTERM, signal_handler)
+
+    print(f"  Kill switches active:")
+    print(f"    - ESC key (Quartz polling)")
+    print(f"    - ESC key (pynput listener)")
+    print(f"    - Ctrl+C in terminal")
+    print(f"    - Mouse to screen corner (PyAutoGUI failsafe)")
+    print(f"    - Hard timeout: {timeout_minutes} minutes")
 
 
 def focus_chrome():
@@ -87,6 +166,17 @@ def wait_for_game_start(timeout=20):
     return False
 
 
+def is_in_game_region(x, y):
+    """Check if screen coordinates are inside the game region.
+
+    This prevents the bot from clicking on random red things outside the game!
+    """
+    left, top, gw, gh = GAME_REGION
+    margin = 10  # Small margin inside the edges
+    return (left + margin <= x <= left + gw - margin and
+            top + margin <= y <= top + gh - margin)
+
+
 def play_one_game(params):
     """Play a single game with the given parameters.
 
@@ -106,6 +196,10 @@ def play_one_game(params):
     start_time = time.time()
 
     while not _kill:
+        # Re-focus Chrome periodically to make sure we're capturing the game
+        if frames > 0 and frames % 200 == 0:
+            focus_chrome()
+
         frame = grab_screen(GAME_REGION)
         targets = find_targets(frame)
 
@@ -130,13 +224,18 @@ def play_one_game(params):
             else:
                 best = targets[0]  # first found
 
-            # Convert to screen coordinates and click
+            # Convert to screen coordinates
             left, top, gw, gh = GAME_REGION
             phys_w, phys_h = frame.shape[1], frame.shape[0]
-            screen_x = left + (best["x"] / phys_w) * gw
-            screen_y = top + (best["y"] / phys_h) * gh
-            pyautogui.click(int(screen_x), int(screen_y))
-            clicks += 1
+            screen_x = int(left + (best["x"] / phys_w) * gw)
+            screen_y = int(top + (best["y"] / phys_h) * gh)
+
+            # SAFETY: Only click if target is inside game region
+            if is_in_game_region(screen_x, screen_y):
+                if _kill:  # Check AGAIN right before clicking
+                    break
+                pyautogui.click(screen_x, screen_y)
+                clicks += 1
         else:
             no_target_streak += 1
             # Only check for game over after game has started
@@ -229,18 +328,18 @@ def mutate_params(params, reward_history):
     return new_params
 
 
-def self_play(max_rounds=None):
+def self_play(max_rounds=None, timeout_minutes=30):
     """Main self-play loop."""
     global _kill
-    _kill = False
 
-    # Start ESC listener
-    esc_thread = threading.Thread(target=_listen_for_esc, daemon=True)
-    esc_thread.start()
+    # Start ALL kill switch listeners
+    start_kill_listeners(timeout_minutes)
 
     print("=" * 50)
     print("  SELF-PLAY MODE")
     print("  Press ESC to stop at any time")
+    print(f"  Game region: {GAME_REGION}")
+    print(f"  Auto-stop: {timeout_minutes} minutes")
     print("=" * 50)
 
     # Load history
@@ -370,10 +469,11 @@ def show_results():
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Self-playing RL loop")
     parser.add_argument("--rounds", type=int, default=None, help="Max games to play (default: infinite)")
+    parser.add_argument("--timeout", type=int, default=30, help="Hard timeout in minutes (default: 30)")
     parser.add_argument("--results", action="store_true", help="Show game history")
     args = parser.parse_args()
 
     if args.results:
         show_results()
     else:
-        self_play(max_rounds=args.rounds)
+        self_play(max_rounds=args.rounds, timeout_minutes=args.timeout)
